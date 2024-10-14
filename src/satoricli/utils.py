@@ -1,35 +1,40 @@
 from pathlib import Path
 import yaml
-import argparse
+from argparse import ArgumentParser
 
-def load_config(config_path=None):
+CREDENTIALS_FILENAME = ".satori_credentials.yml"
+
+config_arg = ArgumentParser(add_help=False)
+config_arg.add_argument(
+    "--config",
+    type=str,
+    help="Directory path for the Satori credentials file",
+    metavar="DIR"
+)
+
+def get_config_path(args):
+    if args.config:
+        return Path(args.config) / CREDENTIALS_FILENAME
+    return Path.home() / CREDENTIALS_FILENAME
+
+def load_config(args):
+    config_path = get_config_path(args)
     config = {}
 
-    locations = [
-        Path(".satori_credentials.yml"),
-        Path.home() / ".satori_credentials.yml",
-    ]
-
-    if config_path:
-        locations.insert(0, Path(config_path))
-
-    for location in locations:
-        if not location.is_file():
-            continue
-
-        config.update(yaml.safe_load(location.read_text()))
+    if config_path.is_file():
+        with config_path.open() as f:
+            config.update(yaml.safe_load(f))
+    else:
+        print(f"Warning: No configuration file found at {config_path}")
 
     return config
 
-def save_config(config: dict):  # TODO: Global/local config
-    with (Path.home() / ".satori_credentials.yml").open("w") as f:
-        f.write(yaml.safe_dump(config))
+def save_config(config: dict, args):
+    config_path = get_config_path(args)
+    
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with config_path.open("w") as f:
+        yaml.safe_dump(config, f)
 
-def main():
-    export_arg = argparse.ArgumentParser(description="Satori CLI")
-    export_arg.add_argument("--config", type=str, help="Path to the configuration file")
-
-
-
-if __name__ == "__main__":
-    main()
+    print(f"Configuration saved to {config_path}")
