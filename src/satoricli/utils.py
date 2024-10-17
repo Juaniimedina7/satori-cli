@@ -2,16 +2,29 @@ from pathlib import Path
 import yaml
 import argparse
 import os
+import sys
+
+CREDENTIALS_FILENAME = ".satori_credentials.yml"
 
 def get_credentials_path():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, help='Path to the credentials file')
-    args, _ = parser.parse_known_args()
-
-    if args.config:
-        return Path(args.config)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--config', type=str, help='Directory path for the credentials file')
     
-    return Path.home() / ".satori_credentials.yml"
+    _, args = parser.parse_known_args(sys.argv[2:])
+
+    config_path = None
+    for i, arg in enumerate(args):
+        if arg == '--config' and i + 1 < len(args):
+            config_path = args[i + 1]
+            break
+        elif arg.startswith('--config='):
+            config_path = arg.split('=', 1)[1]
+            break
+
+    if config_path:
+        return Path(config_path) / CREDENTIALS_FILENAME
+    
+    return Path.home() / CREDENTIALS_FILENAME
 
 def load_config():
     config = {}
@@ -21,23 +34,16 @@ def load_config():
         with credentials_path.open('r') as f:
             config.update(yaml.safe_load(f))
     else:
-        # Fallback to default locations if the specified file doesn't exist
-        locations = (
-            Path(".satori_credentials.yml"),
-            Path.home() / ".satori_credentials.yml",
-        )
-
-        for location in locations:
-            if not location.is_file():
-                continue
-
-            with location.open('r') as f:
+        default_location = Path.home() / CREDENTIALS_FILENAME
+        if default_location.is_file():
+            with default_location.open('r') as f:
                 config.update(yaml.safe_load(f))
 
     return config
 
 def save_config(config: dict):
     credentials_path = get_credentials_path()
+    credentials_path.parent.mkdir(parents=True, exist_ok=True)
     with credentials_path.open("w") as f:
         f.write(yaml.safe_dump(config))
 
