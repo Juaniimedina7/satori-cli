@@ -1,40 +1,44 @@
 from pathlib import Path
 import yaml
-from argparse import ArgumentParser
+import argparse
+import os
 
-CREDENTIALS_FILENAME = ".satori_credentials.yml"
+def get_credentials_path():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, help='Path to the credentials file')
+    args, _ = parser.parse_known_args()
 
-config_arg = ArgumentParser(add_help=False)
-config_arg.add_argument(
-    "--config",
-    type=str,
-    help="Directory path for the Satori credentials file",
-    metavar="DIR"
-)
-
-def get_config_path(args):
     if args.config:
-        return Path(args.config) / CREDENTIALS_FILENAME
-    return Path.home() / CREDENTIALS_FILENAME
+        return Path(args.config)
+    
+    return Path.home() / ".satori_credentials.yml"
 
-def load_config(args):
-    config_path = get_config_path(args)
+def load_config():
     config = {}
+    credentials_path = get_credentials_path()
 
-    if config_path.is_file():
-        with config_path.open() as f:
+    if credentials_path.is_file():
+        with credentials_path.open('r') as f:
             config.update(yaml.safe_load(f))
     else:
-        print(f"Warning: No configuration file found at {config_path}")
+        # Fallback to default locations if the specified file doesn't exist
+        locations = (
+            Path(".satori_credentials.yml"),
+            Path.home() / ".satori_credentials.yml",
+        )
+
+        for location in locations:
+            if not location.is_file():
+                continue
+
+            with location.open('r') as f:
+                config.update(yaml.safe_load(f))
 
     return config
 
-def save_config(config: dict, args):
-    config_path = get_config_path(args)
-    
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with config_path.open("w") as f:
-        yaml.safe_dump(config, f)
+def save_config(config: dict):
+    credentials_path = get_credentials_path()
+    with credentials_path.open("w") as f:
+        f.write(yaml.safe_dump(config))
 
-    print(f"Configuration saved to {config_path}")
+os.environ['SATORI_CONFIG_PATH'] = str(get_credentials_path())
