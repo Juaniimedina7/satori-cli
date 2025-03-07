@@ -27,13 +27,8 @@ def sync():
         repo = git.Repo(PLAYBOOKS_DIR)
         repo.branches["main"].checkout(force=True)
         repo.remote().pull()
-        # print(
-        #    "Satori playbooks' repo https://github.com/satorici/playbooks",
-        #    "updated to latest version",
-        # )
     else:
         git.Repo.clone_from("https://github.com/satorici/playbooks.git", PLAYBOOKS_DIR)
-        # print("Satori Playbooks repo clone started")
     return True
 
 
@@ -41,7 +36,7 @@ def file_finder() -> list[dict]:
     playbooks = []
 
     for playbook in PLAYBOOKS_DIR.rglob("*.yml"):
-        if ".github" in playbook.parts:
+        if ".github" in playbook.parts or playbook.name == ".satori.yml":
             continue
 
         try:
@@ -49,29 +44,38 @@ def file_finder() -> list[dict]:
         except Exception:
             parameters = ()
 
-        scheme = (
-            yaml.safe_load(playbook.read_bytes())
-            .get("settings", {})
-            .get("scheme", "satori")
-        )
-
-        playbooks.append(
-            {
+        try:
+            yaml_content = yaml.safe_load(playbook.read_bytes())
+            scheme = yaml_content.get("settings", {}).get("scheme", "satori")
+            
+            playbooks.append({
                 "uri": f"{scheme}://" + playbook.relative_to(PLAYBOOKS_DIR).as_posix(),
                 "name": get_playbook_name(playbook),
                 "parameters": ", ".join(parameters),
-            }
-        )
+                "image": get_playbook_image(playbook),
+            })
+        except Exception as e:
+            print(f"Error processing playbook {playbook}: {e}")
+            continue
 
     return playbooks
 
+def get_playbook_image(filename: Path) -> str:
+    """Get playbook image from settings or return empty string if not found"""
+    try:
+        config = yaml.safe_load(filename.read_text())
+        return config["settings"]["image"]
+    except Exception:
+        return ""
 
-def get_playbook_name(filename: Path):
+
+def get_playbook_name(filename: Path) -> str:
+    """Get playbook name from settings or return empty string if not found"""
     try:
         config = yaml.safe_load(filename.read_text())
         return config["settings"]["name"]
     except Exception:
-        pass
+        return ""
 
 
 def display_public_playbooks(
