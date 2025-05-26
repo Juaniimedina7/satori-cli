@@ -9,9 +9,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import hashlib
 from netaddr import IPNetwork
-
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
-
 from satoricli.cli.commands.base import BaseCommand
 from satoricli.cli.utils import console, error_console
 
@@ -129,17 +127,13 @@ class ShardsCommand(BaseCommand):
         if not ranges or len(ip_array) == 0:
             return np.zeros(len(ip_array), dtype=bool)
             
-        # Convert ranges to numpy arrays for vectorized operations
         starts = np.array([r[0] for r in ranges])
         ends = np.array([r[1] for r in ranges])
         
-        # Broadcast and check all IPs against all ranges simultaneously
-        # This is MUCH faster than individual binary searches
         ip_expanded = ip_array[:, np.newaxis] 
         starts_expanded = starts[np.newaxis, :] 
         ends_expanded = ends[np.newaxis, :]    
         
-        # Check if each IP is within any range
         in_range = (ip_expanded >= starts_expanded) & (ip_expanded <= ends_expanded)
         return np.any(in_range, axis=1)
 
@@ -148,7 +142,6 @@ class ShardsCommand(BaseCommand):
         if not ranges:
             return False
             
-        # Quick bounds check first
         if ip_int < ranges[0][0] or ip_int > ranges[-1][1]:
             return False
             
@@ -169,26 +162,22 @@ class ShardsCommand(BaseCommand):
 
     def hash_ip_int_vectorized(self, ip_array: np.ndarray, seed: int) -> np.ndarray:
         """Vectorized hash computation using numpy - MASSIVE speedup"""
-        # FNV-1a hash vectorized
-        hash_vals = np.full(ip_array.shape, 2166136261, dtype=np.uint64)  # FNV offset basis
-        
-        # Process each byte of the IP
+
+        hash_vals = np.full(ip_array.shape, 2166136261, dtype=np.uint64)  
         for shift in [0, 8, 16, 24]:
             byte_vals = (ip_array >> shift) & 0xff
             hash_vals ^= byte_vals
             hash_vals *= 16777619
-            hash_vals = hash_vals.astype(np.uint64)  # Prevent overflow
+            hash_vals = hash_vals.astype(np.uint64)
         
-        # Add seed
         hash_vals ^= seed
         hash_vals *= 16777619
         
-        return (hash_vals & 0x7fffffff).astype(np.uint32)  # Keep positive
+        return (hash_vals & 0x7fffffff).astype(np.uint32)
 
     def hash_ip_int(self, ip_int: int, seed: int) -> int:
         """Fast hash using integer directly - fallback for single IPs"""
-        # Use FNV-1a like hash for better distribution
-        hash_val = 2166136261  # FNV offset basis
+        hash_val = 2166136261  
         hash_val ^= ip_int & 0xff
         hash_val *= 16777619
         hash_val ^= (ip_int >> 8) & 0xff
@@ -199,7 +188,7 @@ class ShardsCommand(BaseCommand):
         hash_val *= 16777619
         hash_val ^= seed
         hash_val *= 16777619
-        return hash_val & 0x7fffffff  # Keep positive
+        return hash_val & 0x7fffffff
 
     def int_to_ip_str(self, ip_int: int) -> str:
         """Convert integer to IP string"""
@@ -214,22 +203,17 @@ class ShardsCommand(BaseCommand):
         current_start = range_start
         
         for bl_start, bl_end in blacklist_ranges:
-            # Skip blacklist ranges that don't affect our range
             if bl_end < range_start or bl_start > range_end:
                 continue
-                
-            # If there's a gap before this blacklist range, it's valid
+
             if current_start < bl_start:
                 valid_segments.append((current_start, min(bl_start - 1, range_end)))
             
-            # Move past this blacklist range
             current_start = max(current_start, bl_end + 1)
             
-            # If we've passed our range, we're done
             if current_start > range_end:
                 break
         
-        # Add remaining segment if any
         if current_start <= range_end:
             valid_segments.append((current_start, range_end))
         
@@ -239,11 +223,9 @@ class ShardsCommand(BaseCommand):
                                     shard_x: int, shard_y: int, seed: int) -> tuple:
         """ULTRA-FAST: Process only non-blacklisted segments - skip billions of blacklisted IPs"""
         
-        # PRE-FILTER: Get only valid segments, skip blacklisted ranges entirely
         valid_segments = self.subtract_blacklist_from_range(range_start, range_end, blacklist_ranges)
         
         if not valid_segments:
-            # Entire range is blacklisted - INSTANT SKIP
             total_processed = range_end - range_start + 1
             return total_processed, total_processed, []
         
@@ -251,32 +233,25 @@ class ShardsCommand(BaseCommand):
         total_excluded = total_processed - sum(seg_end - seg_start + 1 for seg_start, seg_end in valid_segments)
         selected_ips = []
         
-        # Process only valid segments - MASSIVE speedup for heavily blacklisted ranges
         for seg_start, seg_end in valid_segments:
             seg_size = seg_end - seg_start + 1
             
-            # Vectorized processing for large segments
-            if seg_size > 100000:  # 100K threshold for vectorization
-                chunk_size = 1000000  # 1M IPs per vectorized chunk
+            if seg_size > 100000:
+                chunk_size = 1000000
                 
                 for chunk_start in range(seg_start, seg_end + 1, chunk_size):
                     chunk_end = min(chunk_start + chunk_size - 1, seg_end)
                     
-                    # Create IP array for vectorized operations
                     ip_array = np.arange(chunk_start, chunk_end + 1, dtype=np.uint32)
                     
-                    # Vectorized hash computation (no blacklist check needed - pre-filtered!)
                     hash_values = self.hash_ip_int_vectorized(ip_array, seed)
                     
-                    # Vectorized shard selection
                     shard_mask = (hash_values % shard_y) == (shard_x - 1)
                     selected_ip_ints = ip_array[shard_mask]
                     
-                    # Convert selected IPs to strings
                     for ip_int in selected_ip_ints:
                         selected_ips.append(self.int_to_ip_str(int(ip_int)))
             else:
-                # Direct processing for small segments
                 for ip_int in range(seg_start, seg_end + 1):
                     hash_val = self.hash_ip_int(ip_int, seed)
                     if (hash_val % shard_y) == (shard_x - 1):
@@ -287,9 +262,8 @@ class ShardsCommand(BaseCommand):
     def read_file_addresses_ultra_parallel(self, file_path: str, blacklist_ranges: list, shard_x: int, shard_y: int, seed: int, num_processes: int, total_items: int) -> tuple:
         """Ultra parallel processing with dynamic work queue for perfect load balancing"""
         
-        # Read and parse input file to get all ranges and non-IP entries
         ip_ranges = []
-        non_ip_entries = []  # For domains, URLs, etc.
+        non_ip_entries = []
         
         with open(file_path, 'r') as f:
             for line in f:
@@ -297,57 +271,47 @@ class ShardsCommand(BaseCommand):
                 if not entry or entry.startswith("#"):
                     continue
                 try:
-                    # Check if it's an IP or IP range
                     if ':' in entry and '/' not in entry and '-' not in entry:
-                        # Could be IP:port or domain:port
                         parts = entry.split(':')
                         if self.is_ip_address(parts[0]):
-                            entry = parts[0]  # Remove port from IP
+                            entry = parts[0]
                     
                     if '/' in entry and (self.is_ip_address(entry.split('/')[0]) or 
                         (entry.count('.') >= 3 and '-' not in entry)):
-                        # CIDR notation
                         network = IPNetwork(entry)
                         ip_ranges.append((int(network.first), int(network.last)))
                     elif '-' in entry and self.is_ip_address(entry.split('-')[0].strip()):
-                        # IP range notation
                         start_ip, end_ip = entry.split('-')
                         start_int = self.ip_to_int(start_ip.strip())
                         end_int = self.ip_to_int(end_ip.strip())
                         if start_int and end_int:
                             ip_ranges.append((start_int, end_int))
                     elif self.is_ip_address(entry):
-                        # Single IP
                         ip_int = self.ip_to_int(entry)
                         if ip_int:
                             ip_ranges.append((ip_int, ip_int))
                     else:
-                        # It's a domain, URL, or something else
                         clean_entry = self.extract_domain_from_entry(entry)
                         if clean_entry:
                             non_ip_entries.append(clean_entry)
                 except Exception:
-                    # If we can't parse it as IP, treat it as domain/URL
                     clean_entry = self.extract_domain_from_entry(entry)
                     if clean_entry:
                         non_ip_entries.append(clean_entry)
         
-        # Process non-IP entries (domains/URLs) with hash-based sharding
         selected_non_ip = []
         for entry in non_ip_entries:
             hash_val = self.hash_string(entry, seed)
             if (hash_val % shard_y) == (shard_x - 1):
                 selected_non_ip.append(entry)
         
-        # AGGRESSIVE CHUNKING for maximum parallelism 
         work_chunks = []
-        chunk_size = 25_000_000  # 25M IPs per chunk - more chunks = better load balancing
+        chunk_size = 25_000_000
         
         for start, end in ip_ranges:
             range_size = end - start + 1
             
             if range_size > chunk_size:
-                # Split large ranges aggressively for perfect distribution
                 current_start = start
                 while current_start <= end:
                     chunk_end = min(current_start + chunk_size - 1, end)
@@ -356,14 +320,12 @@ class ShardsCommand(BaseCommand):
             else:
                 work_chunks.append((start, end))
         
-        # Ultra-fast processing with pre-filtered blacklist
-        total_processed = len(non_ip_entries)  # Count non-IP entries
+        total_processed = len(non_ip_entries)
         total_excluded = 0
-        all_selected = selected_non_ip.copy()  # Start with selected non-IP entries
+        all_selected = selected_non_ip.copy()
         completed_chunks = 0
         
         with ProcessPoolExecutor(max_workers=num_processes) as executor:
-            # Submit individual chunks for maximum granularity
             future_to_chunk = {}
             for i, chunk in enumerate(work_chunks):
                 future = executor.submit(
@@ -372,7 +334,6 @@ class ShardsCommand(BaseCommand):
                 )
                 future_to_chunk[future] = i
             
-            # Collect results silently (progress shown by main spinner)
             for future in as_completed(future_to_chunk):
                 chunk_id = future_to_chunk[future]
                 try:
@@ -395,7 +356,6 @@ class ShardsCommand(BaseCommand):
                 if not entry or entry.startswith("#"):
                     continue
                 try:
-                    # Handle IP:port format - strip port for counting
                     if ':' in entry and '/' not in entry and '-' not in entry:
                         parts = entry.split(':')
                         if self.is_ip_address(parts[0]):
@@ -406,7 +366,6 @@ class ShardsCommand(BaseCommand):
                         network = IPNetwork(entry)
                         total += int(network.last) - int(network.first) + 1
                     elif '-' in entry and self.is_ip_address(entry.split('-')[0].strip()):
-                        # IP range
                         start_ip, end_ip = entry.split('-')
                         start_int = self.ip_to_int(start_ip.strip())
                         end_int = self.ip_to_int(end_ip.strip())
@@ -415,10 +374,8 @@ class ShardsCommand(BaseCommand):
                         else:
                             total += 1
                     else:
-                        # Single IP, domain, or URL
                         total += 1
                 except Exception:
-                    # Count as single entry if we can't parse it
                     total += 1
         return total
 
@@ -431,7 +388,6 @@ class ShardsCommand(BaseCommand):
         results_file = kwargs.get("results_file")
         num_processes = kwargs.get("processes") or mp.cpu_count()
 
-        # Parse shard X/Y
         try:
             x_str, y_str = shard.split("/")
             X = int(x_str)
@@ -444,7 +400,6 @@ class ShardsCommand(BaseCommand):
             error_console.print(f"[error] Invalid shard value: {X}/{Y}")
             return 1
 
-        # Build optimized blacklist ranges
         blacklist_ranges = []
         if exclude_file:
             try:
@@ -453,19 +408,17 @@ class ShardsCommand(BaseCommand):
                 error_console.print(f"[error] Failed to load blacklist: {str(e)}")
                 return 1
 
-        # Count total items and start processing
         total_items = self.count_total_items(input_file)
         console.print(f"Processing {total_items:,} items using {num_processes} cores...")
         
         start_time = time.time()
         
-        # ALWAYS show live spinner with real-time timer
         with Progress(
             SpinnerColumn(),
             TextColumn("[bold blue]Running..."),
             TimeElapsedColumn(),
             console=console,
-            refresh_per_second=10  # 10 FPS for smooth timer
+            refresh_per_second=10
         ) as progress:
             task = progress.add_task("Processing...", total=None)
             total_processed, total_excluded, selected_items = self.read_file_addresses_ultra_parallel(
@@ -499,7 +452,7 @@ class ShardsCommand(BaseCommand):
                 return 1
         return 0
 
-# Ultra-fast worker with blacklist pre-filtering
+
 def process_prefiltered_chunk_worker(chunk_range: tuple, blacklist_ranges: list, shard_x: int, shard_y: int, seed: int, chunk_id: int) -> tuple:
     """HARDCORE worker with blacklist pre-filtering - skip billions of blacklisted IPs"""
     cmd = ShardsCommand()
@@ -512,7 +465,6 @@ def process_prefiltered_chunk_worker(chunk_range: tuple, blacklist_ranges: list,
     return processed, excluded, selected
 
 
-# Fallback worker for compatibility
 def process_single_chunk_worker(chunk_range: tuple, blacklist_ranges: list, shard_x: int, shard_y: int, seed: int, chunk_id: int) -> tuple:
     """Worker function to process a single chunk"""
     cmd = ShardsCommand()
@@ -525,7 +477,6 @@ def process_single_chunk_worker(chunk_range: tuple, blacklist_ranges: list, shar
     return processed, excluded, selected
 
 
-# Keep original worker for compatibility  
 def process_batch_worker(batch_ranges: list, blacklist_ranges: list, shard_x: int, shard_y: int, seed: int, batch_id: int) -> tuple:
     """Worker function to process a batch of IP ranges"""
     cmd = ShardsCommand()
