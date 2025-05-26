@@ -1,135 +1,545 @@
-import random
+import time
 import os
 from argparse import ArgumentParser
-from typing import Optional, List
 from pathlib import Path
-import ipaddress
+import struct
+import socket
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import numpy as np
+import hashlib
+from netaddr import IPNetwork
 
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from satoricli.cli.commands.base import BaseCommand
 from satoricli.cli.utils import console, error_console
 
 
 class ShardsCommand(BaseCommand):
-    
     name = "shards"
-    
+
     def register_args(self, parser: ArgumentParser):
         parser.add_argument("--shard", required=True, help="Current shard and total (X/Y format)")
         parser.add_argument("--seed", type=int, required=True, help="Seed for pseudorandom permutation")
         parser.add_argument("--input", dest="input_file", required=True, help="Input file with addresses (any path)")
         parser.add_argument("--blacklist", dest="exclude_file", help="File with addresses to exclude (any path)")
         parser.add_argument("--results", dest="results_file", help="Save results to text file (must have .txt extension or no extension; default is .txt)")
-    
-    def read_file_addresses(self, file_path: str) -> List[str]:
-        file_path = Path(file_path)
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-        
-        addresses = []
+        parser.add_argument("--processes", type=int, default=None, help="Number of processes (default: CPU count)")
+
+    def ip_to_int(self, ip_str: str) -> int:
+        """Convert IP string to integer using fast socket.inet_aton"""
         try:
-            with open(file_path, 'r') as f:
-                for line in f:
-                    entry = line.strip()
-                    if not entry:
-                        continue
-                    try:
-                        if '/' in entry:
-                            # Es un rango CIDR: expandir todas las IPs
-                            net = ipaddress.IPv4Network(entry, strict=False)
-                            addresses.extend([str(ip) for ip in net])
-                        else:
-                            # Es una IP suelta
-                            addresses.append(entry)
-                    except ValueError:
-                        error_console.print(f"[warning]Skipping invalid address or range: {entry}")
-        except Exception as e:
-            raise ValueError(f"Error reading {file_path}: {str(e)}")
+            return struct.unpack("!I", socket.inet_aton(ip_str))[0]
+        except socket.error:
+            return None
+
+    def is_ip_address(self, value: str) -> bool:
+        """Check if string is an IP address"""
+        try:
+            socket.inet_aton(value)
+            return True
+        except socket.error:
+            return False
+    
+    def hash_string(self, text: str, seed: int) -> int:
+        """Hash any string (domain/URL) for shard selection"""
+        hash_input = f"{text}:{seed}".encode('utf-8')
+        hash_bytes = hashlib.sha256(hash_input).digest()
+        return struct.unpack("!I", hash_bytes[:4])[0] & 0x7fffffff
+
+    def extract_domain_from_entry(self, entry: str) -> str:
+        """Extract domain/URL from entry, removing common prefixes and ports"""
+        for prefix in ['http://', 'https://', 'ftp://', '//']:
+            if entry.startswith(prefix):
+                entry = entry[len(prefix):]
+                break
         
-        return addresses
+        if ':' in entry and self.is_ip_address(entry.split(':')[0]):
+            return entry.split(':')[0]
+        
+        return entry
+
+    def build_blacklist_ranges(self, file_path: str) -> list:
+        """Build sorted list of (start, end) integer ranges for faster lookup"""
+        ranges = []
+        with open(file_path, 'r') as f:
+            for line in f:
+                entry = line.strip()
+                if not entry or entry.startswith("#"):
+                    continue
+                try:
+                    if ':' in entry and '/' not in entry and '-' not in entry:
+                        parts = entry.split(':')
+                        if self.is_ip_address(parts[0]):
+                            entry = parts[0]
+                    
+                    if '/' in entry and (self.is_ip_address(entry.split('/')[0]) or '.' in entry.split('/')[0]):
+                        network = IPNetwork(entry)
+                        ranges.append((int(network.first), int(network.last)))
+                    elif '-' in entry:
+                        start_ip, end_ip = entry.split('-')
+                        start_int = self.ip_to_int(start_ip.strip())
+                        end_int = self.ip_to_int(end_ip.strip())
+                        if start_int and end_int:
+                            ranges.append((start_int, end_int))
+                    elif self.is_ip_address(entry):
+                        ip_int = self.ip_to_int(entry)
+                        if ip_int:
+                            ranges.append((ip_int, ip_int))
+                except Exception:
+                    continue
+        
+        ranges.sort()
+        
+        merged = []
+        for start, end in ranges:
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        
+        return merged
+
+    def is_range_completely_blacklisted(self, range_start: int, range_end: int, blacklist_ranges: list) -> bool:
+        """Check if entire range is covered by blacklist - ULTRA FAST SKIP"""
+        if not blacklist_ranges:
+            return False
             
+        left, right = 0, len(blacklist_ranges) - 1
+        
+        while left <= right:
+            mid = (left + right) >> 1
+            bl_start, bl_end = blacklist_ranges[mid]
+            
+            if bl_start <= range_start and bl_end >= range_end:
+                return True
+                
+            if bl_end < range_start:
+                left = mid + 1
+            elif bl_start > range_end:
+                right = mid - 1
+            else:
+                return False
+        
+        return False
+
+    def is_ip_in_ranges_vectorized(self, ip_array: np.ndarray, ranges: list) -> np.ndarray:
+        """Vectorized blacklist check using numpy for massive speedup"""
+        if not ranges or len(ip_array) == 0:
+            return np.zeros(len(ip_array), dtype=bool)
+            
+        # Convert ranges to numpy arrays for vectorized operations
+        starts = np.array([r[0] for r in ranges])
+        ends = np.array([r[1] for r in ranges])
+        
+        # Broadcast and check all IPs against all ranges simultaneously
+        # This is MUCH faster than individual binary searches
+        ip_expanded = ip_array[:, np.newaxis] 
+        starts_expanded = starts[np.newaxis, :] 
+        ends_expanded = ends[np.newaxis, :]    
+        
+        # Check if each IP is within any range
+        in_range = (ip_expanded >= starts_expanded) & (ip_expanded <= ends_expanded)
+        return np.any(in_range, axis=1)
+
+    def is_ip_in_ranges(self, ip_int: int, ranges: list) -> bool:
+        """Optimized binary search with early termination - fallback for single IPs"""
+        if not ranges:
+            return False
+            
+        # Quick bounds check first
+        if ip_int < ranges[0][0] or ip_int > ranges[-1][1]:
+            return False
+            
+        left, right = 0, len(ranges) - 1
+        
+        while left <= right:
+            mid = (left + right) >> 1
+            start, end = ranges[mid]
+            
+            if ip_int < start:
+                right = mid - 1
+            elif ip_int > end:
+                left = mid + 1
+            else:
+                return True
+        
+        return False
+
+    def hash_ip_int_vectorized(self, ip_array: np.ndarray, seed: int) -> np.ndarray:
+        """Vectorized hash computation using numpy - MASSIVE speedup"""
+        # FNV-1a hash vectorized
+        hash_vals = np.full(ip_array.shape, 2166136261, dtype=np.uint64)  # FNV offset basis
+        
+        # Process each byte of the IP
+        for shift in [0, 8, 16, 24]:
+            byte_vals = (ip_array >> shift) & 0xff
+            hash_vals ^= byte_vals
+            hash_vals *= 16777619
+            hash_vals = hash_vals.astype(np.uint64)  # Prevent overflow
+        
+        # Add seed
+        hash_vals ^= seed
+        hash_vals *= 16777619
+        
+        return (hash_vals & 0x7fffffff).astype(np.uint32)  # Keep positive
+
+    def hash_ip_int(self, ip_int: int, seed: int) -> int:
+        """Fast hash using integer directly - fallback for single IPs"""
+        # Use FNV-1a like hash for better distribution
+        hash_val = 2166136261  # FNV offset basis
+        hash_val ^= ip_int & 0xff
+        hash_val *= 16777619
+        hash_val ^= (ip_int >> 8) & 0xff
+        hash_val *= 16777619
+        hash_val ^= (ip_int >> 16) & 0xff
+        hash_val *= 16777619
+        hash_val ^= (ip_int >> 24) & 0xff
+        hash_val *= 16777619
+        hash_val ^= seed
+        hash_val *= 16777619
+        return hash_val & 0x7fffffff  # Keep positive
+
+    def int_to_ip_str(self, ip_int: int) -> str:
+        """Convert integer to IP string"""
+        return socket.inet_ntoa(struct.pack("!I", ip_int))
+
+    def subtract_blacklist_from_range(self, range_start: int, range_end: int, blacklist_ranges: list) -> list:
+        """HARDCORE: Pre-filter blacklist to get only valid IP segments - MASSIVE speedup"""
+        if not blacklist_ranges:
+            return [(range_start, range_end)]
+        
+        valid_segments = []
+        current_start = range_start
+        
+        for bl_start, bl_end in blacklist_ranges:
+            # Skip blacklist ranges that don't affect our range
+            if bl_end < range_start or bl_start > range_end:
+                continue
+                
+            # If there's a gap before this blacklist range, it's valid
+            if current_start < bl_start:
+                valid_segments.append((current_start, min(bl_start - 1, range_end)))
+            
+            # Move past this blacklist range
+            current_start = max(current_start, bl_end + 1)
+            
+            # If we've passed our range, we're done
+            if current_start > range_end:
+                break
+        
+        # Add remaining segment if any
+        if current_start <= range_end:
+            valid_segments.append((current_start, range_end))
+        
+        return valid_segments
+
+    def process_ip_range_pre_filtered(self, range_start: int, range_end: int, blacklist_ranges: list, 
+                                    shard_x: int, shard_y: int, seed: int) -> tuple:
+        """ULTRA-FAST: Process only non-blacklisted segments - skip billions of blacklisted IPs"""
+        
+        # PRE-FILTER: Get only valid segments, skip blacklisted ranges entirely
+        valid_segments = self.subtract_blacklist_from_range(range_start, range_end, blacklist_ranges)
+        
+        if not valid_segments:
+            # Entire range is blacklisted - INSTANT SKIP
+            total_processed = range_end - range_start + 1
+            return total_processed, total_processed, []
+        
+        total_processed = range_end - range_start + 1
+        total_excluded = total_processed - sum(seg_end - seg_start + 1 for seg_start, seg_end in valid_segments)
+        selected_ips = []
+        
+        # Process only valid segments - MASSIVE speedup for heavily blacklisted ranges
+        for seg_start, seg_end in valid_segments:
+            seg_size = seg_end - seg_start + 1
+            
+            # Vectorized processing for large segments
+            if seg_size > 100000:  # 100K threshold for vectorization
+                chunk_size = 1000000  # 1M IPs per vectorized chunk
+                
+                for chunk_start in range(seg_start, seg_end + 1, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size - 1, seg_end)
+                    
+                    # Create IP array for vectorized operations
+                    ip_array = np.arange(chunk_start, chunk_end + 1, dtype=np.uint32)
+                    
+                    # Vectorized hash computation (no blacklist check needed - pre-filtered!)
+                    hash_values = self.hash_ip_int_vectorized(ip_array, seed)
+                    
+                    # Vectorized shard selection
+                    shard_mask = (hash_values % shard_y) == (shard_x - 1)
+                    selected_ip_ints = ip_array[shard_mask]
+                    
+                    # Convert selected IPs to strings
+                    for ip_int in selected_ip_ints:
+                        selected_ips.append(self.int_to_ip_str(int(ip_int)))
+            else:
+                # Direct processing for small segments
+                for ip_int in range(seg_start, seg_end + 1):
+                    hash_val = self.hash_ip_int(ip_int, seed)
+                    if (hash_val % shard_y) == (shard_x - 1):
+                        selected_ips.append(self.int_to_ip_str(ip_int))
+        
+        return total_processed, total_excluded, selected_ips
+
+    def read_file_addresses_ultra_parallel(self, file_path: str, blacklist_ranges: list, shard_x: int, shard_y: int, seed: int, num_processes: int, total_items: int) -> tuple:
+        """Ultra parallel processing with dynamic work queue for perfect load balancing"""
+        
+        # Read and parse input file to get all ranges and non-IP entries
+        ip_ranges = []
+        non_ip_entries = []  # For domains, URLs, etc.
+        
+        with open(file_path, 'r') as f:
+            for line in f:
+                entry = line.strip()
+                if not entry or entry.startswith("#"):
+                    continue
+                try:
+                    # Check if it's an IP or IP range
+                    if ':' in entry and '/' not in entry and '-' not in entry:
+                        # Could be IP:port or domain:port
+                        parts = entry.split(':')
+                        if self.is_ip_address(parts[0]):
+                            entry = parts[0]  # Remove port from IP
+                    
+                    if '/' in entry and (self.is_ip_address(entry.split('/')[0]) or 
+                        (entry.count('.') >= 3 and '-' not in entry)):
+                        # CIDR notation
+                        network = IPNetwork(entry)
+                        ip_ranges.append((int(network.first), int(network.last)))
+                    elif '-' in entry and self.is_ip_address(entry.split('-')[0].strip()):
+                        # IP range notation
+                        start_ip, end_ip = entry.split('-')
+                        start_int = self.ip_to_int(start_ip.strip())
+                        end_int = self.ip_to_int(end_ip.strip())
+                        if start_int and end_int:
+                            ip_ranges.append((start_int, end_int))
+                    elif self.is_ip_address(entry):
+                        # Single IP
+                        ip_int = self.ip_to_int(entry)
+                        if ip_int:
+                            ip_ranges.append((ip_int, ip_int))
+                    else:
+                        # It's a domain, URL, or something else
+                        clean_entry = self.extract_domain_from_entry(entry)
+                        if clean_entry:
+                            non_ip_entries.append(clean_entry)
+                except Exception:
+                    # If we can't parse it as IP, treat it as domain/URL
+                    clean_entry = self.extract_domain_from_entry(entry)
+                    if clean_entry:
+                        non_ip_entries.append(clean_entry)
+        
+        # Process non-IP entries (domains/URLs) with hash-based sharding
+        selected_non_ip = []
+        for entry in non_ip_entries:
+            hash_val = self.hash_string(entry, seed)
+            if (hash_val % shard_y) == (shard_x - 1):
+                selected_non_ip.append(entry)
+        
+        # AGGRESSIVE CHUNKING for maximum parallelism 
+        work_chunks = []
+        chunk_size = 25_000_000  # 25M IPs per chunk - more chunks = better load balancing
+        
+        for start, end in ip_ranges:
+            range_size = end - start + 1
+            
+            if range_size > chunk_size:
+                # Split large ranges aggressively for perfect distribution
+                current_start = start
+                while current_start <= end:
+                    chunk_end = min(current_start + chunk_size - 1, end)
+                    work_chunks.append((current_start, chunk_end))
+                    current_start = chunk_end + 1
+            else:
+                work_chunks.append((start, end))
+        
+        # Ultra-fast processing with pre-filtered blacklist
+        total_processed = len(non_ip_entries)  # Count non-IP entries
+        total_excluded = 0
+        all_selected = selected_non_ip.copy()  # Start with selected non-IP entries
+        completed_chunks = 0
+        
+        with ProcessPoolExecutor(max_workers=num_processes) as executor:
+            # Submit individual chunks for maximum granularity
+            future_to_chunk = {}
+            for i, chunk in enumerate(work_chunks):
+                future = executor.submit(
+                    process_prefiltered_chunk_worker, 
+                    chunk, blacklist_ranges, shard_x, shard_y, seed, i
+                )
+                future_to_chunk[future] = i
+            
+            # Collect results silently (progress shown by main spinner)
+            for future in as_completed(future_to_chunk):
+                chunk_id = future_to_chunk[future]
+                try:
+                    chunk_processed, chunk_excluded, chunk_selected = future.result()
+                    total_processed += chunk_processed
+                    total_excluded += chunk_excluded
+                    all_selected.extend(chunk_selected)
+                    completed_chunks += 1
+                except Exception as exc:
+                    console.print(f"Error in chunk {chunk_id}: {exc}")
+        
+        return total_processed, total_excluded, all_selected
+
+    def count_total_items(self, file_path: str) -> int:
+        """Quick count of total items (IPs + domains/URLs) for progress tracking"""
+        total = 0
+        with open(file_path, 'r') as f:
+            for line in f:
+                entry = line.strip()
+                if not entry or entry.startswith("#"):
+                    continue
+                try:
+                    # Handle IP:port format - strip port for counting
+                    if ':' in entry and '/' not in entry and '-' not in entry:
+                        parts = entry.split(':')
+                        if self.is_ip_address(parts[0]):
+                            entry = parts[0]
+                    
+                    if '/' in entry and (self.is_ip_address(entry.split('/')[0]) or 
+                        (entry.count('.') >= 3 and '-' not in entry)):
+                        network = IPNetwork(entry)
+                        total += int(network.last) - int(network.first) + 1
+                    elif '-' in entry and self.is_ip_address(entry.split('-')[0].strip()):
+                        # IP range
+                        start_ip, end_ip = entry.split('-')
+                        start_int = self.ip_to_int(start_ip.strip())
+                        end_int = self.ip_to_int(end_ip.strip())
+                        if start_int and end_int:
+                            total += end_int - start_int + 1
+                        else:
+                            total += 1
+                    else:
+                        # Single IP, domain, or URL
+                        total += 1
+                except Exception:
+                    # Count as single entry if we can't parse it
+                    total += 1
+        return total
+
     def __call__(self, **kwargs):
+
         shard = kwargs["shard"]
         seed = kwargs["seed"]
         input_file = kwargs["input_file"]
         exclude_file = kwargs.get("exclude_file")
         results_file = kwargs.get("results_file")
+        num_processes = kwargs.get("processes") or mp.cpu_count()
 
+        # Parse shard X/Y
         try:
             x_str, y_str = shard.split("/")
             X = int(x_str)
             Y = int(y_str)
         except ValueError:
-            error_console.print("[error]ERROR:[/] Invalid format for --shard. Use X/Y")
+            error_console.print("[error] Invalid format for --shard. Use X/Y")
             return 1
-        
+
         if Y < 1 or X < 1 or X > Y:
-            error_console.print(f"[error]ERROR:[/] Invalid shard value: {X}/{Y}")
+            error_console.print(f"[error] Invalid shard value: {X}/{Y}")
             return 1
-        
-        try:
-            addresses = self.read_file_addresses(input_file)
-            if not addresses:
-                error_console.print(f"[error]ERROR:[/] No valid addresses found in: {input_file}")
-                return 1
-        except FileNotFoundError:
-            error_console.print(f"[error]ERROR:[/] Input file not found: {input_file}")
-            return 1
-        except ValueError as e:
-            error_console.print(f"[error]ERROR:[/] {str(e)}")
-            return 1
-        
-        # Apply exclude list if provided
-        exclude_set = set()
+
+        # Build optimized blacklist ranges
+        blacklist_ranges = []
         if exclude_file:
             try:
-                exclude_addresses = self.read_file_addresses(exclude_file)
-                for addr in exclude_addresses:
-                    exclude_set.add(addr)
-                    if ":" not in addr:
-                        exclude_set.add(addr + ":")
-            except FileNotFoundError:
-                error_console.print(f"[error]ERROR:[/] Exclude file not found: {exclude_file}")
+                blacklist_ranges = self.build_blacklist_ranges(exclude_file)
+            except Exception as e:
+                error_console.print(f"[error] Failed to load blacklist: {str(e)}")
                 return 1
-            except ValueError as e:
-                error_console.print(f"[error]ERROR:[/] Error in exclude file: {str(e)}")
-                return 1
+
+        # Count total items and start processing
+        total_items = self.count_total_items(input_file)
+        console.print(f"Processing {total_items:,} items using {num_processes} cores...")
         
-        filtered_addresses = []
-        for addr in addresses:
-            if addr in exclude_set:
-                continue
-            ip_part = addr.split(":")[0] if ":" in addr else addr
-            if ip_part + ":" in exclude_set:
-                continue
-            filtered_addresses.append(addr)
+        start_time = time.time()
         
-        rnd = random.Random(seed)
-        rnd.shuffle(filtered_addresses)
+        # ALWAYS show live spinner with real-time timer
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]Running..."),
+            TimeElapsedColumn(),
+            console=console,
+            refresh_per_second=10  # 10 FPS for smooth timer
+        ) as progress:
+            task = progress.add_task("Processing...", total=None)
+            total_processed, total_excluded, selected_items = self.read_file_addresses_ultra_parallel(
+                input_file, blacklist_ranges, X, Y, seed, num_processes, total_items
+            )
         
-        shard_addresses = [addr for index, addr in enumerate(filtered_addresses) if index % Y == (X-1)]
+        end_time = time.time()
         
+        console.print(f"Completed in {end_time - start_time:.1f}s - Selected {len(selected_items):,} items - Excluded {total_excluded:,} IPs")
+        
+        included = total_processed - total_excluded
+
         if results_file:
             try:
                 output_path = Path(results_file)
                 extension = output_path.suffix.lower()
                 if not extension:
                     output_path = Path(str(output_path) + '.txt')
-                    console.print(f"No extension provided, using: {output_path}")
                 elif extension != '.txt':
-                    error_console.print(f"[error]ERROR:[/] Unsupported file extension: {extension}. Only .txt format is supported.")
+                    error_console.print(f"[error] Unsupported file extension: {extension}. Only .txt format is supported.")
                     return 1
-                
+
                 os.makedirs(output_path.parent, exist_ok=True)
+                
                 with open(output_path, 'w') as f:
-                    for addr in shard_addresses:
+                    for addr in selected_items:
                         f.write(f"{addr}\n")
-                console.print(f"Results saved to {output_path}")
+                console.print(f"Saved to {output_path}")
             except Exception as e:
-                error_console.print(f"[error]ERROR:[/] Failed to write to output file: {str(e)}")
+                error_console.print(f"[error] Failed to write output file: {str(e)}")
                 return 1
-        else:
-            for addr in shard_addresses:
-                console.print(addr)
-            
         return 0
+
+# Ultra-fast worker with blacklist pre-filtering
+def process_prefiltered_chunk_worker(chunk_range: tuple, blacklist_ranges: list, shard_x: int, shard_y: int, seed: int, chunk_id: int) -> tuple:
+    """HARDCORE worker with blacklist pre-filtering - skip billions of blacklisted IPs"""
+    cmd = ShardsCommand()
+    
+    range_start, range_end = chunk_range
+    processed, excluded, selected = cmd.process_ip_range_pre_filtered(
+        range_start, range_end, blacklist_ranges, shard_x, shard_y, seed
+    )
+    
+    return processed, excluded, selected
+
+
+# Fallback worker for compatibility
+def process_single_chunk_worker(chunk_range: tuple, blacklist_ranges: list, shard_x: int, shard_y: int, seed: int, chunk_id: int) -> tuple:
+    """Worker function to process a single chunk"""
+    cmd = ShardsCommand()
+    
+    range_start, range_end = chunk_range
+    processed, excluded, selected = cmd.process_ip_range_ultra_vectorized(
+        range_start, range_end, blacklist_ranges, shard_x, shard_y, seed
+    )
+    
+    return processed, excluded, selected
+
+
+# Keep original worker for compatibility  
+def process_batch_worker(batch_ranges: list, blacklist_ranges: list, shard_x: int, shard_y: int, seed: int, batch_id: int) -> tuple:
+    """Worker function to process a batch of IP ranges"""
+    cmd = ShardsCommand()
+    
+    total_processed = 0
+    total_excluded = 0
+    all_selected = []
+    
+    for range_start, range_end in batch_ranges:
+        processed, excluded, selected = cmd.process_ip_range_ultra_vectorized(
+            range_start, range_end, blacklist_ranges, shard_x, shard_y, seed
+        )
+        total_processed += processed
+        total_excluded += excluded
+        all_selected.extend(selected)
+    
+    return total_processed, total_excluded, all_selected
