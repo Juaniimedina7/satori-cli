@@ -49,6 +49,15 @@ class DashboardCommand(BaseCommand):
 
     @staticmethod
     def generate_dashboard(info: dict, pending: bool = False):
+        reports_rows = info["reports"]["rows"]
+        if not reports_rows:
+            # User has no reports yet, so show a message to get started
+            console.print("No reports yet.\n")
+            console.print("Run a playbook to get started:")
+            console.print("  [b]satori run ./ --sync[/]")
+            console.print("  [b]satori run playbook.yml --sync[/]\n")
+            console.print("Docs: https://docs.satori.ci/")
+            return
         if info["monitors"]["pending"]["rows"] and pending:
             console.rule("[b][blue]Monitors[/blue] (Actions required)", style="white")
             autotable(
@@ -72,11 +81,11 @@ class DashboardCommand(BaseCommand):
                 for repo in info["repos"]["list"]["rows"]
             ]
             autotable(repos, "b green", True)
-        if info["reports"]["rows"]:
+        if reports_rows:
             console.rule("[b red]Last 10 Reports", style="red")
             reports = []
             # Remove unused columns
-            for report in info["reports"]["rows"]:
+            for report in reports_rows:
                 reports.append(
                     {
                         "id": report["id"],
