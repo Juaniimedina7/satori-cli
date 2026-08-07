@@ -981,7 +981,6 @@ class ReportsCommand(BaseCommand):
                     console.print(res_decode["message"])
             return 0
         elif action == "stop":
-            del params["page"]
             if not filters.get("status"):
                 filters["status"] = "Running"
             if not force:
