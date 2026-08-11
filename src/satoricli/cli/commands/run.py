@@ -22,6 +22,7 @@ from satoricli.bundler import make_bundle
 from satoricli.cli.commands.run_script import run_script
 from satoricli.cli.commands.scan import ScanCommand
 from satoricli.cli.utils import log
+from satoricli.playbooks import resolve_public_playbook_name
 from satoricli.validations import get_parameters, validate_parameters
 
 from ..utils import (
@@ -254,7 +255,10 @@ class RunCommand(BaseCommand):
         parser.add_argument(
             "-p",
             "--playbook",
-            help="if PATH is a directory this playbook will be used",
+            help=(
+                "if PATH is a directory this playbook will be used "
+                "(local file, satori:// URI, or public short name)"
+            ),
         )
         parser.add_argument("--save-report", type=str, default=None)
         parser.add_argument("--save-output", type=str, default=None)
@@ -374,6 +378,30 @@ class RunCommand(BaseCommand):
                 playbook = path
                 path = "."
 
+        # Resolve bare PATH to public playbook short name → ./ + satori:// URI
+        if (
+            playbook is None
+            and "://" not in path
+            and not Path(path).is_file()
+            and not Path(path).is_dir()
+        ):
+            uri = resolve_public_playbook_name(path)
+            if uri:
+                path = "."
+                playbook = uri
+            else:
+                error_console.print(f"ERROR: Playbook not found: {path}")
+                return 1
+
+        # Resolve --playbook short names (and path promoted via --repo)
+        if playbook and "://" not in playbook and not os.path.isfile(playbook):
+            uri = resolve_public_playbook_name(playbook)
+            if uri:
+                playbook = uri
+            else:
+                error_console.print("ERROR: Invalid playbook arg.")
+                return 1
+
         if path == "." and parsed_data and "REPO" in parsed_data:
             # Check if playbook is a file (not a uri) and read it
             if playbook and "://" not in playbook and os.path.isfile(playbook):
@@ -400,10 +428,6 @@ class RunCommand(BaseCommand):
                 text_format,
                 total_commits=info["total"],
             )
-
-        if playbook and "://" not in playbook and not os.path.isfile(playbook):
-            error_console.print("ERROR: Invalid playbook arg.")
-            return 1
 
         if "://" in path:
             with warnings.catch_warnings(record=True):

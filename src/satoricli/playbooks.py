@@ -79,6 +79,23 @@ def get_playbook_name(filename: Path):
         pass
 
 
+# Short names for `satori run <name>` → public playbook URI
+PUBLIC_PLAYBOOK_SHORT_NAMES = {
+    "pyspector": "satori://code/python/pyspector.yml",
+    "semgrep": "satori://code/semgrep.yml",
+}
+
+
+def resolve_public_playbook_name(name: str) -> Optional[str]:
+    """Resolve a known short public playbook name to a full satori:// URI."""
+    stem = name
+    if stem.endswith(".yml"):
+        stem = stem[: -len(".yml")]
+    elif stem.endswith(".yaml"):
+        stem = stem[: -len(".yaml")]
+    return PUBLIC_PLAYBOOK_SHORT_NAMES.get(stem)
+
+
 def display_public_playbooks(
     playbook_id: Optional[str] = None,
     original: bool = False,
