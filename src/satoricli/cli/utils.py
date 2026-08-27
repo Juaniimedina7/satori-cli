@@ -736,7 +736,7 @@ def print_output(
     if filter_tests:  # Display only selected tests
         res = run_test_filter(filter_tests, res)
     if print_json:
-        console.print(res, highlight=False, markup=False)
+        console.print_json(data=res)
     else:
         format_outputs(res, text_format)
 
