@@ -416,6 +416,7 @@ class RunCommand(BaseCommand):
                 "run_params": " ".join(sys.argv[1:]),
                 "run_last": True,
                 "visibility": resolved_visibility.upper(),
+                "settings": json.dumps(cli_settings),
             }
             info = client.post("/scan", json=params).json()
             report = sync if sync else report
