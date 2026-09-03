@@ -253,6 +253,14 @@ class RunCommand(BaseCommand):
             "-d", "--data", type=load_cli_params, action="append", default=[]
         )
         parser.add_argument(
+            "--split",
+            type=load_cli_params,
+            action="append",
+            default=[],
+            metavar="KEY=SEPARATOR",
+            help="Split a -d parameter value by SEPARATOR into multiple inputs (e.g. --split DOMAIN=\\\\n)",
+        )
+        parser.add_argument(
             "-p",
             "--playbook",
             help=(
@@ -322,6 +330,7 @@ class RunCommand(BaseCommand):
         sync: bool,
         data: list[tuple[str, str]],
         data_file: list[tuple[str, str]],
+        split: list[tuple[str, str]],
         include_list: list,
         repo: Optional[str],
         save_report: Union[str, bool, None],
@@ -362,6 +371,12 @@ class RunCommand(BaseCommand):
         modes = {"sync": sync, "output": output, "report": report}
 
         parsed_data = tuple_to_dict(data) if data else None
+        if parsed_data and split:
+            for key, separator in split:
+                if key in parsed_data and isinstance(parsed_data[key], str):
+                    sep = separator.encode().decode("unicode_escape")
+                    value = parsed_data[key].encode().decode("unicode_escape")
+                    parsed_data[key] = [v for v in value.split(sep) if v]
         if parsed_data and not validate_parameters(parsed_data):
             raise ValueError("Malformed parameters")
 
